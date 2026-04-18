@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MedScan - AI Medical Report Summarizer</title>
+    
+    <!-- Scripts & Styles -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/preact/dist/preact.min.js"></script>
+    <script src="https://unpkg.com/preact/hooks/dist/hooks.umd.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <style>
+        :root {
+            --radius: 0.75rem;
+            --background: #0f172a;
+            --foreground: #f8fafc;
+            --border: rgba(255, 255, 255, 0.12);
+            --primary: #38bdf8;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #08111e, #0f172a, #111827);
+            min-height: 100vh;
+            color: var(--foreground);
+            margin: 0;
+            overflow-x: hidden;
+        }
+
+        .glass-card {
+            background: rgba(255, 255, 255, 0.06);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 22px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+        }
+
+        .glass-card-sm {
+            background: rgba(255, 255, 255, 0.06);
+            backdrop-filter: blur(18px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 18px;
+        }
+
+        .bg-blur {
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(100px);
+            opacity: 0.22;
+            z-index: 0;
+            pointer-events: none;
+        }
+        .bg-blur-1 { width: 260px; height: 260px; background: #0ea5e9; top: 80px; left: -60px; }
+        .bg-blur-2 { width: 320px; height: 320px; background: #22c55e; bottom: 40px; right: -80px; }
+
+        @keyframes pulse-green { 0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.3); } 50% { box-shadow: 0 0 0 8px rgba(34, 197, 94, 0); } }
+        @keyframes pulse-yellow { 0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.3); } 50% { box-shadow: 0 0 0 8px rgba(245, 158, 11, 0); } }
+        @keyframes pulse-red { 0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.3); } 50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); } }
+
+        .traffic-green { animation: pulse-green 2s infinite; }
+        .traffic-yellow { animation: pulse-yellow 2s infinite; }
+        .traffic-red { animation: pulse-red 1.5s infinite; }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .loader-spin { width: 28px; height: 28px; border: 4px solid rgba(56, 189, 248, 0.2); border-top: 4px solid #38bdf8; border-radius: 50%; animation: spin 0.8s linear infinite; }
+
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(56, 189, 248, 0.3); border-radius: 3px; }
+
+        .landing-video { position: fixed; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; z-index: 0; }
+        .landing-overlay { position: fixed; inset: 0; z-index: 1; background: linear-gradient(135deg, rgba(8,17,30,0.2), rgba(15,23,42,0.4)); }
+
+        .drop-zone { border: 2px dashed rgba(255, 255, 255, 0.2); border-radius: 16px; transition: all 0.3s ease; }
+        .drop-zone.active { border-color: #38bdf8; background: rgba(56, 189, 248, 0.08); transform: scale(1.01); }
+    </style>
+</head>
+<body>
+    <div id="app"></div>
+
+    <script>
+        const { h, render } = preact;
+        const { useState, useEffect } = preactHooks;
+
+        // --- Configuration ---
+        const PRIMARY_MODEL = "meta-llama/llama-4-scout";
+        const GRANDMA_SYSTEM_PROMPT = `You are a warm, patient, and deeply reassuring medical summarizer for Medscan Everywhere. Your goal is to provide comfort, clarity, and peace of mind.
+
+STRICT RULE: Keep the section headings EXACTLY as they are in English (TL;DR, KEY FINDINGS, TRAFFIC LIGHTS, GLOSSARY OF TERMS, DIET PLAN, DOCTOR QUESTIONS, DOCTOR SUGGESTION, DISCLAIMER).
+STRICT RULE: Use [GREEN], [YELLOW], or [RED] tags in TRAFFIC LIGHTS.
+STRICT RULE: Maximum 400 words. No markdown formatting.`;
+
+        // --- Components ---
+        const Icon = ({ name, size = 18, className = "" }) => {
+            useEffect(() => { if (window.lucide) lucide.createIcons(); }, [name]);
+            return h('i', { 'data-lucide': name, style: { width: size, height: size }, className });
+        };
+
+        const AuthPage = ({ onAuth }) => {
+            const [isLogin, setIsLogin] = useState(true);
+            const [email, setEmail] = useState("");
+            const [password, setPassword] = useState("");
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                if (!email || !password) return alert("Please fill all fields");
+                
+                const users = JSON.parse(localStorage.getItem('medscan_users') || '{}');
+                if (isLogin) {
+                    if (users[email] === password) {
+                        localStorage.setItem('medscan_current_user', email);
+                        onAuth(email);
+                    } else {
+                        alert("Invalid credentials");
+                    }
+                } else {
+                    if (users[email]) return alert("User already exists");
+                    users[email] = password;
+                    localStorage.setItem('medscan_users', JSON.stringify(users));
+                    localStorage.setItem('medscan_current_user', email);
+                    alert("Account created! Welcome to MedScan.");
+                    onAuth(email);
+                }
+            };
+
+            return h('div', { className: "min-h-screen flex items-center justify-center relative p-4" }, [
+                h('div', { className: "bg-blur bg-blur-1" }),
+                h('div', { className: "bg-blur bg-blur-2" }),
+                h('div', { className: "glass-card p-8 w-full max-w-md relative z-10 animate-in zoom-in-95 duration-300" }, [
+                    h('div', { className: "text-center mb-8" }, [
+                        h('div', { className: "w-16 h-16 bg-sky-500/10 rounded-2xl flex items-center justify-center mx-auto mb-4" }, h(Icon, { name: 'stethoscope', size: 32, className: "text-sky-400" })),
+                        h('h2', { className: "text-3xl font-bold text-white" }, isLogin ? "Welcome Back" : "Create Account"),
+                        h('p', { className: "text-slate-400 mt-2" }, isLogin ? "Access your medical summaries" : "Start understanding your reports today")
+                    ]),
+                    h('form', { onSubmit: handleSubmit, className: "space-y-4" }, [
+                        h('div', null, [
+                            h('label', { className: "block text-xs font-bold text-slate-500 uppercase mb-2" }, "Email Address"),
+                            h('input', { type: "email", className: "w-full bg-slate-900 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:ring-1 ring-sky-500", value: email, onInput: e => setEmail(e.target.value) })
+                        ]),
+                        h('div', null, [
+                            h('label', { className: "block text-xs font-bold text-slate-500 uppercase mb-2" }, "Password"),
+                            h('input', { type: "password", className: "w-full bg-slate-900 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:ring-1 ring-sky-500", value: password, onInput: e => setPassword(e.target.value) })
+                        ]),
+                        h('button', { type: "submit", className: "w-full py-4 bg-sky-500 text-slate-900 font-bold rounded-xl shadow-lg shadow-sky-500/20 hover:bg-sky-400 transition-colors" }, isLogin ? "Sign In" : "Sign Up")
+                    ]),
+                    h('button', { onClick: () => setIsLogin(!isLogin), className: "w-full mt-6 text-sm text-slate-400 hover:text-sky-400" }, 
+                        isLogin ? "Don't have an account? Sign up" : "Already have an account? Sign in"
+                    )
+                ])
+            ]);
+        };
+
+        const Navbar = ({ onSignOut, onOpenSettings }) => (
+            h('nav', { className: "w-full sticky top-0 z-50 backdrop-blur-xl border-b border-white/10 bg-slate-900/70" }, [
+                h('div', { className: "max-w-7xl mx-auto px-4 sm:px-7 py-3 flex justify-between items-center" }, [
+                    h('div', { className: "flex items-center gap-3" }, [
+                        h('div', { className: "w-10 h-10 rounded-xl bg-sky-500/10 flex items-center justify-center" }, h(Icon, { name: 'stethoscope', className: "text-sky-400" })),
+                        h('h1', { className: "text-xl font-bold text-white" }, "MedScan")
+                    ]),
+                    h('div', { className: "flex items-center gap-3" }, [
+                        h('button', { onClick: onOpenSettings, className: "flex items-center gap-2 text-sm text-slate-400 hover:text-white mr-4" }, [h(Icon, { name: 'settings', size: 16 }), "Settings"]),
+                        h('button', { onClick: onSignOut, className: "flex items-center gap-2 text-sm text-slate-400 hover:text-white" }, [h(Icon, { name: 'log-out', size: 16 }), h('span', null, "Sign Out")])
+                    ])
+                ])
+            ])
+        );
+
+        const SettingsModal = ({ isOpen, onClose, apiKey, setApiKey }) => {
+            if (!isOpen) return null;
+            return h('div', { className: "fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md" }, [
+                h('div', { className: "glass-card p-8 w-full max-w-md relative" }, [
+                    h('button', { onClick: onClose, className: "absolute top-4 right-4 text-slate-500 hover:text-white" }, h(Icon, { name: 'x', size: 20 })),
+                    h('h2', { className: "text-2xl font-bold text-white mb-2" }, "Settings"),
+                    h('div', { className: "space-y-4" }, [
+                        h('div', null, [
+                            h('label', { className: "block text-xs font-bold text-slate-500 uppercase mb-2" }, "OpenRouter API Key"),
+                            h('input', { type: "password", className: "w-full bg-slate-900 border border-white/10 rounded-xl px-4 py-3 text-sm text-white outline-none", value: apiKey, onInput: (e) => setApiKey(e.target.value) })
+                        ]),
+                        h('div', { className: "flex gap-3" }, [
+                            h('button', { onClick: async () => { try { const res = await fetch("https://openrouter.ai/api/v1/models", { headers: { "Authorization": `Bearer ${apiKey}` } }); if (res.ok) alert("Success!"); else alert("Failed " + res.status); } catch (e) { alert(e.message); } }, className: "flex-1 py-3 border border-white/10 text-white rounded-xl text-sm" }, "Test"),
+                            h('button', { onClick: onClose, className: "flex-1 py-3 bg-sky-500 text-slate-900 font-bold rounded-xl text-sm" }, "Save")
+                        ])
+                    ])
+                ])
+            ]);
+        };
+
+        const ReportDisplay = ({ report, onBack, onTranslate, translation, translating }) => {
+            const [viewMode, setViewMode] = useState('english');
+            
+            const parseSummary = (raw) => {
+                if (!raw) return {};
+                const getSection = (name) => {
+                    const regex = new RegExp(`${name}\\s*\\n([\\s\\S]*?)(?=\\n[A-Z\\s;]+|$)`, "i");
+                    const match = raw.match(regex);
+                    return match ? match[1].trim() : "";
+                };
+                const trafficText = getSection("TRAFFIC LIGHTS");
+                const trafficLights = [];
+                if (trafficText) {
+                    trafficText.split('\n').forEach(line => {
+                        const l = line.trim();
+                        if (!l) return;
+                        let type = "green";
+                        if (l.toUpperCase().includes("[YELLOW]")) type = "yellow";
+                        if (l.toUpperCase().includes("[RED]")) type = "red";
+                        trafficLights.push({ type, text: l.replace(/\[.*?\]\s*-?\s*/, '') });
+                    });
+                }
+                return { tldr: getSection("TL;DR"), keyFindings: getSection("KEY FINDINGS"), trafficLights, glossary: getSection("GLOSSARY OF TERMS"), dietPlan: getSection("DIET PLAN"), doctorQuestions: getSection("DOCTOR QUESTIONS"), doctorSuggestion: getSection("DOCTOR SUGGESTION"), disclaimer: getSection("DISCLAIMER") };
+            };
+
+            const data = parseSummary(viewMode === 'hindi' && translation ? translation : report.summary);
+
+            const [speaking, setSpeaking] = useState(false);
+            const handleTTS = () => {
+                if (speaking) { window.speechSynthesis.cancel(); setSpeaking(false); }
+                else {
+                    const utter = new SpeechSynthesisUtterance(viewMode === 'hindi' ? translation : report.summary);
+                    utter.onend = () => setSpeaking(false);
+                    window.speechSynthesis.speak(utter);
+                    setSpeaking(true);
+                }
+            };
+
+            const handleSearchNearby = () => {
+                const query = (data.doctorSuggestion || "General Physician").split('\n')[0] + " near me";
+                window.open(`https://www.google.com/maps/search/${encodeURIComponent(query)}`, '_blank');
+            };
+
+            const handleExportPdf = () => {
+                const { jsPDF } = window.jspdf;
+                const doc = new jsPDF();
+                const margin = 20;
+                let y = 20;
+
+                doc.setFontSize(22); doc.setTextColor(0, 150, 255);
+                doc.text("MedScan Report Summary", margin, y);
+                y += 15;
+
+                doc.setFontSize(10); doc.setTextColor(100);
+                doc.text(`File: ${report.fileName} | Date: ${new Date().toLocaleDateString()}`, margin, y);
+                y += 10;
+                doc.line(margin, y, 190, y);
+                y += 10;
+
+                const addSection = (title, content) => {
+                    if (!content) return;
+                    if (y > 270) { doc.addPage(); y = 20; }
+                    doc.setFontSize(12); doc.setTextColor(0); doc.setFont("helvetica", "bold");
+                    doc.text(title, margin, y);
+                    y += 7;
+                    doc.setFontSize(10); doc.setFont("helvetica", "normal");
+                    const lines = doc.splitTextToSize(content, 170);
+                    doc.text(lines, margin, y);
+                    y += (lines.length * 5) + 10;
+                };
+
+                addSection("TL;DR", data.tldr);
+                addSection("KEY FINDINGS", data.keyFindings);
+                addSection("DIET PLAN", data.dietPlan);
+                addSection("GLOSSARY", data.glossary);
+                addSection("DOCTOR SUGGESTION", data.doctorSuggestion);
+                
+                doc.setFontSize(8); doc.setTextColor(150);
+                doc.text("Disclaimer: AI-generated summary. Consult a doctor.", margin, 285);
+
+                doc.save(`MedScan_${report.fileName.split('.')[0]}.pdf`);
+            };
+
+            return h('div', { className: "space-y-6" }, [
+                h('div', { className: "flex items-center justify-between" }, [
+                    h('button', { onClick: onBack, className: "text-slate-400 hover:text-white text-sm flex items-center gap-2" }, [h(Icon, { name: 'arrow-left', size: 16 }), "Back"]),
+                    h('div', { className: "flex gap-2" }, [
+                        h('button', { onClick: handleExportPdf, className: "px-3 py-1.5 rounded-xl text-sm font-medium bg-white/5 border border-white/10 text-white hover:bg-white/10" }, [h(Icon, { name: 'download', size: 16, className: "inline mr-2" }), "Export PDF"]),
+                        h('button', { onClick: handleTTS, className: `flex items-center gap-2 px-3 py-1.5 rounded-xl text-sm font-medium border ${speaking ? "bg-sky-500/20 text-sky-400 border-sky-500/40" : "border-slate-700 text-slate-300"}` }, [
+                            h(Icon, { name: speaking ? 'volume-x' : 'volume-2', size: 16 }), speaking ? "Stop" : "Listen"
+                        ]),
+                        h('button', { onClick: () => { if (viewMode === 'english') { if (!translation) onTranslate(); setViewMode('hindi'); } else setViewMode('english'); }, className: "px-3 py-1.5 rounded-xl text-sm font-medium border border-slate-700 text-slate-300" }, translating ? "Translating..." : viewMode === 'hindi' ? "Show English" : "Hindi"),
+                        h('span', { className: "px-3 py-1 bg-white/10 rounded-lg text-xs text-slate-400 border border-white/10" }, report.fileType)
+                    ])
+                ]),
+                h('div', { className: "glass-card p-6" }, h('div', { className: "flex gap-4" }, [h(Icon, { name: 'sparkles', className: "text-sky-400" }), h('div', null, [h('h3', { className: "text-xs font-bold text-sky-400 uppercase mb-2" }, "TL;DR"), h('p', { className: "text-slate-200" }, data.tldr)])])),
+                h('div', { className: "glass-card p-6" }, h('div', { className: "flex gap-4" }, [h(Icon, { name: 'activity', className: "text-sky-400" }), h('div', null, [h('h3', { className: "text-xs font-bold text-white uppercase mb-3" }, "Findings"), h('p', { className: "text-slate-300 whitespace-pre-line" }, data.keyFindings)])])),
+                data.trafficLights.length > 0 && h('div', { className: "glass-card p-6" }, [h('h3', { className: "text-xs font-bold text-white uppercase mb-4" }, "Traffic Lights"), h('div', { className: "space-y-3" }, data.trafficLights.map((item, i) => h('div', { key: i, className: `flex items-center gap-3 p-4 rounded-xl ${item.type === 'green' ? 'bg-emerald-950/40' : item.type === 'yellow' ? 'bg-amber-950/40' : 'bg-red-950/40'}` }, [h('span', { className: `w-2.5 h-2.5 rounded-full ${item.type === 'green' ? 'bg-emerald-400' : item.type === 'yellow' ? 'bg-amber-400' : 'bg-red-400'}` }), h('p', { className: "text-slate-300 text-sm" }, item.text)])))]),
+                h('div', { className: "grid grid-cols-1 md:grid-cols-2 gap-6" }, [
+                    h('div', { className: "glass-card p-6" }, [h('h3', { className: "text-xs font-bold text-white uppercase mb-3" }, "Glossary"), h('p', { className: "text-slate-300 text-sm" }, data.glossary)]),
+                    h('div', { className: "glass-card p-6" }, [h('h3', { className: "text-xs font-bold text-white uppercase mb-3" }, "Questions"), h('p', { className: "text-slate-300 text-sm" }, data.doctorQuestions)])
+                ]),
+                h('div', { className: "glass-card p-6 bg-emerald-500/5 border-emerald-500/20" }, [h('h3', { className: "text-xs font-bold text-emerald-400 uppercase mb-3" }, "Diet Plan"), h('p', { className: "text-slate-300 text-sm whitespace-pre-line" }, data.dietPlan)]),
+                h('div', { className: "glass-card p-6 bg-sky-500/5 border-sky-500/20" }, [
+                    h('div', { className: "flex justify-between items-center flex-wrap gap-4" }, [
+                        h('div', null, [
+                            h('h3', { className: "text-xs font-bold text-sky-400 uppercase mb-1" }, "Specialist Recommendation"),
+                            h('p', { className: "text-slate-400 text-sm" }, data.doctorSuggestion)
+                        ]),
+                        h('button', { onClick: handleSearchNearby, className: "px-5 py-2 rounded-xl bg-sky-500 text-slate-900 font-bold text-sm" }, "Find Specialist Nearby")
+                    ])
+                ]),
+                h('footer', { className: "text-center opacity-70 mt-8" }, h('p', { className: "text-[10px] text-slate-500 italic" }, data.disclaimer))
+            ]);
+        };
+
+        const App = () => {
+            const [view, setView] = useState('landing');
+            const [user, setUser] = useState(() => localStorage.getItem('medscan_current_user'));
+            const [reports, setReports] = useState(() => JSON.parse(localStorage.getItem('medscan_history') || '[]'));
+            const [apiKey, setApiKey] = useState(() => localStorage.getItem('medscan_api_key') || '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');
+            const [selectedReport, setSelectedReport] = useState(null);
+            const [showSettings, setShowSettings] = useState(false);
+            const [analyzing, setAnalyzing] = useState(false);
+            const [pasteText, setPasteText] = useState("");
+            const [status, setStatus] = useState("Ready");
+            const [logs, setLogs] = useState([]);
+            const [translations, setTranslations] = useState({});
+            const [translating, setTranslating] = useState(false);
+
+            const log = (msg) => setLogs(prev => [...prev.slice(-5), `${new Date().toLocaleTimeString()}: ${msg}`]);
+
+            useEffect(() => { localStorage.setItem('medscan_history', JSON.stringify(reports)); }, [reports]);
+            useEffect(() => { localStorage.setItem('medscan_api_key', apiKey); }, [apiKey]);
+
+            const callAi = async (text, visualData, model = PRIMARY_MODEL) => {
+                const messages = [{ role: 'system', content: GRANDMA_SYSTEM_PROMPT }];
+                if (visualData) {
+                    messages.push({
+                        role: 'user',
+                        content: [
+                            { type: 'text', text: "Please analyze this medical report image and provide a summary." },
+                            { type: 'image_url', image_url: { url: visualData } }
+                        ]
+                    });
+                } else {
+                    messages.push({ role: 'user', content: text });
+                }
+
+                log(`AI Request: ${visualData ? 'Vision' : 'Text'} mode`);
+                const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                    method: "POST",
+                    headers: { 
+                        "Authorization": `Bearer ${apiKey}`, 
+                        "Content-Type": "application/json", 
+                        "HTTP-Referer": "https://medscan.local", 
+                        "X-Title": "MedScan Standalone" 
+                    },
+                    body: JSON.stringify({ 
+                        model: model, 
+                        messages, 
+                        temperature: 0.4,
+                        max_tokens: 1000
+                    })
+                });
+
+                if (!res.ok) {
+                    const errText = await res.text();
+                    log(`API Error: ${res.status}`);
+                    if (res.status === 401) throw new Error("Invalid API Key. Please check Settings.");
+                    throw new Error(`API Error ${res.status}: ${errText}`);
+                }
+                const data = await res.json();
+                if (data.error) throw new Error(data.error.message || "AI Error");
+                return data.choices[0].message.content;
+            };
+
+            const callAiWithFallback = async (text, visualData) => {
+                try {
+                    return await callAi(text, visualData, PRIMARY_MODEL);
+                } catch (e) {
+                    log(`Primary model failed, trying fallback...`);
+                    return await callAi(text, visualData, "nvidia/nemotron-3-super-120b-a12b:free");
+                }
+            };
+
+            const handleAnalyze = async (file, text) => {
+                if (!file && !text) return;
+                setAnalyzing(true); setStatus("Scanning..."); log("Scan started");
+                try {
+                    let textToProcess = text || "";
+                    let fileType = file ? (file.type.includes('pdf') ? 'pdf' : 'image') : 'text';
+                    let visualData = null;
+                    if (file) {
+                        if (fileType === 'pdf') {
+                            log("Initializing PDF Engine...");
+                            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                            const loadingTask = pdfjsLib.getDocument({ data: await file.arrayBuffer() });
+                            const pdf = await loadingTask.promise;
+                            log(`PDF Loaded: ${pdf.numPages} pages`);
+                            for (let i = 1; i <= Math.min(pdf.numPages, 3); i++) {
+                                log(`Reading page ${i}...`);
+                                const page = await pdf.getPage(i);
+                                textToProcess += (await page.getTextContent()).items.map(s => s.str).join(" ") + "\n";
+                            }
+                            if (textToProcess.length < 50) {
+                                const page = await pdf.getPage(1);
+                                const canvas = document.createElement('canvas');
+                                const viewport = page.getViewport({ scale: 1.5 });
+                                canvas.height = viewport.height; canvas.width = viewport.width;
+                                await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+                                visualData = canvas.toDataURL('image/jpeg'); fileType = 'image';
+                            }
+                        } else {
+                            visualData = await new Promise(r => { const reader = new FileReader(); reader.onload = () => r(reader.result); reader.readAsDataURL(file); });
+                        }
+                    }
+                    setStatus("Thinking..."); log("Calling AI...");
+                    const summary = await callAiWithFallback(textToProcess, visualData);
+                    const rep = { id: Date.now().toString(), fileName: file ? file.name : "Text", fileType, summary, createdAt: new Date().toISOString() };
+                    setReports([rep, ...reports]); setSelectedReport(rep); setView('report'); setStatus("Ready");
+                } catch (e) { log(e.message); setStatus("Error"); alert(e.message); } finally { setAnalyzing(false); }
+            };
+
+            const handleTranslate = async (id, text) => {
+                setTranslating(true); log("Translating...");
+                try {
+                    const prompt = `Translate to Hindi. Keep headings in English. Keep [GREEN/YELLOW/RED]. Summary:\n${text}`;
+                    const res = await callAi(prompt, null);
+                    setTranslations(prev => ({ ...prev, [id]: res }));
+                } catch (e) { log(e.message); } finally { setTranslating(false); }
+            };
+
+            if (view === 'landing') return h('div', { className: "min-h-screen flex items-center justify-center relative overflow-hidden" }, [
+                h('video', { className: "landing-video", autoPlay: true, loop: true, muted: true, playsInline: true }, h('source', { src: "public/human_video.mp4", type: "video/mp4" })),
+                h('div', { className: "landing-overlay" }),
+                h('div', { className: "relative z-10 text-center px-4" }, [
+                    h('h1', { className: "text-6xl font-bold text-white mb-4" }, "MEDSCAN"),
+                    h('p', { className: "text-white text-lg mb-10" }, "AI-Powered Medical Report Summarizer"),
+                    h('button', { onClick: () => setView('dashboard'), className: "px-10 py-4 rounded-xl font-bold bg-gradient-to-r from-sky-400 to-sky-600 text-slate-900" }, "Explore System")
+                ])
+            ]);
+
+            if (!user) return h(AuthPage, { onAuth: (email) => setUser(email) });
+
+            return h('div', { className: "min-h-screen relative pb-12" }, [
+                h('div', { className: "bg-blur bg-blur-1" }), h('div', { className: "bg-blur bg-blur-2" }),
+                h(Navbar, { onSignOut: () => { localStorage.removeItem('medscan_current_user'); setUser(null); setView('landing'); }, onOpenSettings: () => setShowSettings(true) }),
+                h(SettingsModal, { isOpen: showSettings, onClose: () => setShowSettings(false), apiKey, setApiKey }),
+                h('main', { className: "max-w-5xl mx-auto px-4 mt-12" }, 
+                    view === 'report' ? h(ReportDisplay, { report: selectedReport, onBack: () => setView('dashboard'), onTranslate: () => handleTranslate(selectedReport.id, selectedReport.summary), translation: translations[selectedReport.id], translating }) : [
+                        h('section', { className: "mb-12" }, [
+                            h('h2', { className: "text-4xl font-bold text-white mb-4" }, ["Understand Reports ", h('span', { className: "text-sky-400" }, "Simply")]),
+                            h('div', { className: "glass-card p-6" }, [
+                                h('textarea', { className: "w-full min-h-[120px] bg-slate-900/80 border border-white/10 rounded-2xl p-4 text-white outline-none mb-4", placeholder: "Paste report text here...", value: pasteText, onInput: e => setPasteText(e.target.value) }),
+                                h('div', { className: "flex gap-3" }, [
+                                    h('label', { className: "flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-white/5 border border-dashed border-white/20 rounded-xl cursor-pointer text-sm" }, ["Upload File", h('input', { type: "file", className: "hidden", onChange: e => handleAnalyze(e.target.files[0]) })]),
+                                    h('button', { disabled: analyzing, onClick: () => handleAnalyze(null, pasteText), className: "flex-[2] py-3 bg-sky-500 text-slate-900 rounded-xl font-bold disabled:opacity-50" }, analyzing ? "Analyzing..." : "Summarize Now")
+                                ])
+                            ])
+                        ]),
+                        h('div', { className: "grid grid-cols-1 md:grid-cols-2 gap-6" }, [
+                            h('div', { className: "glass-card p-5" }, [h('h3', { className: "text-sm font-bold text-white mb-2" }, "Status"), h('p', { className: "text-xs text-slate-500" }, status)]),
+                            h('div', { className: "glass-card p-5" }, [h('h3', { className: "text-sm font-bold text-white mb-3" }, "History"), h('div', { className: "space-y-2 max-h-40 overflow-y-auto custom-scrollbar" }, reports.length === 0 ? "Empty" : reports.map(r => h('div', { onClick: () => { setSelectedReport(r); setView('report'); }, className: "p-2 rounded-lg bg-white/5 border border-white/5 cursor-pointer text-xs flex justify-between" }, [h('span', null, r.fileName), h('button', { onClick: e => { e.stopPropagation(); setReports(reports.filter(x => x.id !== r.id)); } }, "×")])) )])
+                        ])
+                    ]
+                ),
+                h('div', { className: "fixed bottom-4 left-4 text-[10px] text-slate-700 font-mono opacity-50" }, logs.map((l, i) => h('div', { key: i }, l)))
+            ]);
+        };
+
+        render(h(App), document.getElementById('app'));
+    </script>
+</body>
+</html>
